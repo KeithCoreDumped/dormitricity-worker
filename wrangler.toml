@@ -1,0 +1,21 @@
+name = "dormitricity-worker"
+main = "src/index.ts"
+compatibility_date = "2025-08-01"
+
+# [triggers]
+# crons = ["*/10 * * * *"]   # triggers scheduled() every 10 mins
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dormdb"
+database_id = "e610cff2-0816-4f38-a71b-7580c01eacb7"
+
+[vars]
+GH_OWNER    = "KeithCoreDumped"
+GH_REPO     = "dormitricity-crawler"
+GH_WORKFLOW = "crawler.yml"
+GH_REF      = "master"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
