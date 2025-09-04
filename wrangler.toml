@@ -2,8 +2,8 @@ name = "dormitricity-worker"
 main = "src/index.ts"
 compatibility_date = "2025-08-01"
 
-# [triggers]
-# crons = ["*/10 * * * *"]   # triggers scheduled() every 10 mins
+[triggers]
+crons = ["*/10 * * * *"]   # triggers scheduled() every 10 mins
 
 [[d1_databases]]
 binding = "DB"

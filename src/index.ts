@@ -1,17 +1,50 @@
-import { sign, verify } from "./jwt.js";
-import { fetchEnabledTargets, createJobWithSlices, claimOneSlice, ingestBatch } from "./db.js";
+import { sign as signActionsJwt, verify as verifyActionsJwt } from "./jwt.js";
+import {
+    fetchEnabledTargets,
+    createJobWithSlices,
+    claimOneSlice,
+    ingestBatch,
+    ensureTargetEnabled,
+    insertSubscription,
+    listSubscriptionsWithLatest,
+    updateSubscriptionAlert,
+    deleteSubscriptionAndMaybeDisableTarget,
+    getSeries,
+} from "./db.js";
 import { dispatchWorkflow } from "./github.js";
-import type { Env } from "./types.js";
-import type { Target } from "./db.js";
+import type { Env, Target } from "./types.js";
+import { hashPassword, verifyPassword, signUser, verifyUser } from "./auth.js";
+import { hmacDorm } from "./hmac.js";
+import { ALLOW_ORIGINS, buildCorsHeaders, isPreflight } from "./cors.js";
+
+function json(data: any, status = 200) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: { "Content-Type": "application/json" },
+    });
+}
+
+async function requireUser(req: Request, env: Env) {
+    const tok = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!tok) return null;
+    return await verifyUser(env, tok);
+}
 
 function chunk<T>(arr: T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size));
-  return out;
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+}
+async function parseJSON<T = any>(req: Request): Promise<T> {
+    try {
+        return await req.json();
+    } catch {
+        throw new Response("Bad JSON", { status: 400 });
+    }
 }
 
 const scheduled = async (_: ScheduledEvent | undefined, env: Env) => {
-    console.log("in scheduled()")
+    console.log("in scheduled()");
     const targets: Target[] = await fetchEnabledTargets(env.DB);
     if (targets.length === 0) return;
 
@@ -19,65 +52,227 @@ const scheduled = async (_: ScheduledEvent | undefined, env: Env) => {
     const jobId = crypto.randomUUID();
     await createJobWithSlices(env.DB, jobId, slices);
 
-    const token = await sign(env, {
-      iss: "dormitricity-orchestrator",
-      aud: "gh-actions",
-      job_id: jobId,
-      scope: ["claim","ingest"],
-      exp: Math.floor(Date.now()/1000) + 10*60
+    const token = await signActionsJwt(env, {
+        iss: "dormitricity-orchestrator",
+        aud: "gh-actions",
+        job_id: jobId,
+        scope: ["claim", "ingest"],
+        exp: Math.floor(Date.now() / 1000) + 10 * 60,
     });
-    
+
     await dispatchWorkflow(env, { job_id: jobId, token });
-  }
-export default {
-  scheduled,
-  
-  async fetch(req: Request, env: Env) {
+};
+
+const route = async (req: Request, env: Env) => {
     const url = new URL(req.url);
-    
+    const { pathname, searchParams } = url;
+
+    if (pathname === "/" && req.method === "GET") {
+        return json({ ok: true, name: "Dormitricity backend" });
+    }
+
     if (url.pathname === "/trigger") {
-      await scheduled(undefined, env);
-      return new Response("scheduled() triggered manually");
+        await scheduled(undefined, env);
+        return new Response("scheduled() triggered manually");
     }
 
     if (url.pathname === "/orchestrator/claim" && req.method === "POST") {
-      const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-      const payload = await verify(env, token);
-      if (!payload.scope?.includes("claim")) return new Response("forbidden", { status: 403 });
-      const body = await req.json() as { job_id: string };
-      const { job_id } = body;
-      // const { job_id } = await req.json();
-      if (payload.job_id !== body.job_id) return new Response("bad job", { status: 400 });
+        const token = (req.headers.get("authorization") || "").replace(
+            /^Bearer\s+/i,
+            ""
+        );
+        const payload = await verifyActionsJwt(env, token);
+        if (!payload.scope?.includes("claim"))
+            return new Response("forbidden", { status: 403 });
+        const body = (await req.json()) as { job_id: string };
+        const { job_id } = body;
+        // const { job_id } = await req.json();
+        if (payload.job_id !== body.job_id)
+            return new Response("bad job", { status: 400 });
 
-      const slice = await claimOneSlice(env.DB, job_id);
-      if (!slice) return new Response(null, { status: 204 });
-      return Response.json({ job_id, ...slice, deadline_ts: Math.floor(Date.now()/1000)+8*60 });
-      /*
-      {
-        "job_id": "uuid",
-        "slice_index": 0,
-        "targets": [
-          { "hashed_dir":"hashA...", "canonical_id":"campus:1:2:301" },
-          { "hashed_dir":"hashB...", "canonical_id":"campus:1:2:302" }
-        ],
-        "deadline_ts": 169...
-      }
-      */
+        const slice = await claimOneSlice(env.DB, job_id);
+        if (!slice) return new Response(null, { status: 204 });
+        return Response.json({
+            job_id,
+            ...slice,
+            deadline_ts: Math.floor(Date.now() / 1000) + 8 * 60,
+        });
+        /*
+            {
+              "job_id": "uuid",
+              "slice_index": 0,
+              "targets": [
+                { "hashed_dir":"hashA...", "canonical_id":"campus:1:2:301" },
+                { "hashed_dir":"hashB...", "canonical_id":"campus:1:2:302" }
+              ],
+              "deadline_ts": 169...
+            }
+            */
     }
 
     if (url.pathname === "/ingest" && req.method === "POST") {
-      const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-      const payload = await verify(env, token);
-      if (!payload.scope?.includes("ingest")) return new Response("forbidden", { status: 403 });
+        const token = (req.headers.get("authorization") || "").replace(
+            /^Bearer\s+/i,
+            ""
+        );
+        const payload = await verifyActionsJwt(env, token);
+        if (!payload.scope?.includes("ingest"))
+            return new Response("forbidden", { status: 403 });
 
-      // const body = await req.json();
-      const body = await req.json() as { job_id: string };
-      if (payload.job_id !== body.job_id) return new Response("bad job", { status: 400 });
+        // const body = await req.json();
+        const body = (await req.json()) as { job_id: string };
+        if (payload.job_id !== body.job_id)
+            return new Response("bad job", { status: 400 });
 
-      await ingestBatch(env.DB, body);
-      return new Response("OK");
+        await ingestBatch(env.DB, body);
+        return new Response("OK");
+    }
+
+    // ========= 用户认证 =========
+    if (pathname === "/auth/register" && req.method === "POST") {
+        const { email, password } = await parseJSON<{
+            email: string;
+            password: string;
+        }>(req);
+        if (!email || !password) return json({ error: "BAD_INPUT" }, 400);
+
+        const exists = await env.DB.prepare(
+            "SELECT 1 FROM users WHERE email=?1"
+        )
+            .bind(email)
+            .all();
+        if (exists.results.length) return json({ error: "EMAIL_IN_USE" }, 409);
+
+        const uid = crypto.randomUUID();
+        const pw_hash = await hashPassword(password);
+        await env.DB.prepare(
+            "INSERT INTO users (id,email,pw_hash,created_ts) VALUES (?1,?2,?3,?4)"
+        )
+            .bind(uid, email, pw_hash, Math.floor(Date.now() / 1000))
+            .run();
+
+        const token = await signUser(env, { uid, email });
+        return json({ token });
+    }
+
+    if (pathname === "/auth/login" && req.method === "POST") {
+        const { email, password } = await parseJSON<{
+            email: string;
+            password: string;
+        }>(req);
+        const r = await env.DB.prepare(
+            "SELECT id, pw_hash FROM users WHERE email=?1"
+        )
+            .bind(email)
+            .all();
+        const row = (r.results as any[])[0];
+        if (!row) return json({ error: "BAD_CREDENTIALS" }, 401);
+        const ok = await verifyPassword(password, row.pw_hash);
+        if (!ok) return json({ error: "BAD_CREDENTIALS" }, 401);
+        const token = await signUser(env, { uid: row.id, email });
+        return json({ token });
+    }
+    if (pathname === "/subs" && req.method === "GET") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+        const items = await listSubscriptionsWithLatest(env.DB, user.uid);
+        return json({ items });
+    }
+
+    if (pathname === "/subs" && req.method === "POST") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+        const { canonical_id, email_alert } = await parseJSON<{
+            canonical_id: string;
+            email_alert?: boolean;
+        }>(req);
+
+        const hashed = await hmacDorm(env, canonical_id);
+
+        try {
+            await Promise.all([
+                ensureTargetEnabled(env.DB, hashed, canonical_id),
+                insertSubscription(
+                    env.DB,
+                    user.uid,
+                    hashed,
+                    canonical_id,
+                    !!email_alert
+                ),
+            ]);
+        } catch (e: any) {
+            const msg = String(e?.message || e);
+            if (msg.includes("MAX_SUBS_REACHED"))
+                return json({ error: "MAX_SUBS_REACHED" }, 400);
+            if (msg.includes("UNIQUE"))
+                return json({ error: "ALREADY_SUBSCRIBED" }, 409);
+            return json({ error: "DB_ERROR", detail: msg }, 500);
+        }
+        return json({ ok: true, hashed_dir: hashed });
+    }
+
+    if (pathname.startsWith("/subs/") && req.method === "PUT") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+        const hashed = pathname.split("/").pop()!;
+        const { email_alert } = await parseJSON<{ email_alert: boolean }>(req);
+        await updateSubscriptionAlert(env.DB, user.uid, hashed, !!email_alert);
+        return json({ ok: true });
+    }
+
+    if (pathname.startsWith("/subs/") && req.method === "DELETE") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+        const hashed = pathname.split("/").pop()!;
+        await deleteSubscriptionAndMaybeDisableTarget(env.DB, user.uid, hashed);
+        return json({ ok: true });
+    }
+
+    // ========= 时序查询 =========
+    // GET /series/:hashed_dir?since=unix&limit=1000
+    if (pathname.startsWith("/series/") && req.method === "GET") {
+        const hashed = pathname.split("/").pop()!;
+        const since = parseInt(searchParams.get("since") || "0", 10);
+        const limit = Math.min(
+            parseInt(searchParams.get("limit") || "1000", 10),
+            5000
+        );
+        const points = await getSeries(
+            env.DB,
+            hashed,
+            isNaN(since) ? 0 : since,
+            limit
+        );
+        return json({ hashed_dir: hashed, points });
     }
 
     return new Response("Not Found", { status: 404 });
-  }
+};
+
+export default {
+    scheduled,
+
+    async fetch(req: Request, env: Env) {
+        // check preflight/CORS
+        const origin = req.headers.get("Origin") || "";
+        const okOrigin = ALLOW_ORIGINS.has(origin);
+        if (isPreflight(req)) {
+            return new Response(null, {
+                status: okOrigin ? 204 : 403,
+                headers: okOrigin ? buildCorsHeaders(origin) : {},
+            });
+        }
+
+        // 你原有的路由处理
+        const res = await route(req, env); // 假设你把原逻辑封装成 route()
+
+        // 给实际响应也加上 CORS 头（仅允许的来源）
+        if (okOrigin) {
+            const h = new Headers(res.headers);
+            const cors = buildCorsHeaders(origin);
+            for (const [k, v] of Object.entries(cors)) h.set(k, v);
+            return new Response(res.body, { status: res.status, headers: h });
+        }
+        return res;
+    },
 };
