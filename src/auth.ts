@@ -10,7 +10,7 @@ export async function hashPassword(pw: string, salt?: Uint8Array) {
     { name: "PBKDF2", hash: "SHA-256", salt: s as BufferSource, iterations: 10_000 }, key, 256
   );
   const out = new Uint8Array(bits);
-  return `pbkdf2$120000$${btoa(String.fromCharCode(...s))}$${btoa(String.fromCharCode(...out))}`;
+  return `pbkdf2$10000$${btoa(String.fromCharCode(...s))}$${btoa(String.fromCharCode(...out))}`;
 }
 
 export async function verifyPassword(pw: string, stored: string) {

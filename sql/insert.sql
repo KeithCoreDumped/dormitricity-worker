@@ -7,4 +7,4 @@ INSERT OR IGNORE INTO crawl_targets(hashed_dir,canonical_id,enabled) VALUES
     ('hashC','10-1223',1),
     ('hashD','5-1223',1);
 
--- npx wrangler d1 execute dormdb --remote --file=./insert.sql
+-- npx wrangler d1 execute dormdb --remote --file=./sql/insert.sql

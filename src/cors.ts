@@ -1,7 +1,7 @@
 export const ALLOW_ORIGINS = new Set([
   "http://localhost:3000",
-  "http://localhost:13001",
-  "https://your-frontend-domain.com",
+  "https://dormitricity.ddns.net",
+  "https://dormitricity-frontend.vercel.app",
 ]);
 
 export function buildCorsHeaders(origin: string) {

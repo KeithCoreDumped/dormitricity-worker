@@ -9,7 +9,10 @@ import {
     listSubscriptionsWithLatest,
     updateSubscriptionAlert,
     deleteSubscriptionAndMaybeDisableTarget,
-    getSeries,
+    // getSeries,
+    getSeriesForUser,
+    getUserById,
+    deleteUser,
 } from "./db.js";
 import { dispatchWorkflow } from "./github.js";
 import type { Env, Target } from "./types.js";
@@ -231,19 +234,62 @@ const route = async (req: Request, env: Env) => {
     // ========= 时序查询 =========
     // GET /series/:hashed_dir?since=unix&limit=1000
     if (pathname.startsWith("/series/") && req.method === "GET") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+
         const hashed = pathname.split("/").pop()!;
         const since = parseInt(searchParams.get("since") || "0", 10);
         const limit = Math.min(
             parseInt(searchParams.get("limit") || "1000", 10),
             5000
         );
-        const points = await getSeries(
+
+        const { forbidden, points } = await getSeriesForUser(
             env.DB,
+            user.uid,
             hashed,
             isNaN(since) ? 0 : since,
             limit
         );
+        if (forbidden) return json({ error: "NOT_FOUND_OR_EMPTY" }, 404);
+
         return json({ hashed_dir: hashed, points });
+    }
+    // if (pathname.startsWith("/series/") && req.method === "GET") {
+    //     const hashed = pathname.split("/").pop()!;
+    //     const since = parseInt(searchParams.get("since") || "0", 10);
+    //     const limit = Math.min(
+    //         parseInt(searchParams.get("limit") || "1000", 10),
+    //         5000
+    //     );
+    //     const points = await getSeries(
+    //         env.DB,
+    //         hashed,
+    //         isNaN(since) ? 0 : since,
+    //         limit
+    //     );
+    //     return json({ hashed_dir: hashed, points });
+    // }
+
+    if (pathname === "/auth/delete" && req.method === "POST") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+
+        const { email } = await parseJSON<{ email: string }>(req);
+        if (!email) return json({ error: "EMAIL_REQUIRED" }, 400);
+
+        // 取数据库中的邮箱并校验（大小写不敏感，去除首尾空格）
+        const dbUser = await getUserById(env.DB, user.uid);
+        if (!dbUser) return json({ error: "USER_NOT_FOUND" }, 404);
+
+        const normalize = (s: string) => s.trim().toLowerCase();
+        if (normalize(email) !== normalize(dbUser.email)) {
+            return json({ error: "EMAIL_MISMATCH" }, 400);
+        }
+
+        // 通过校验，执行删除（含级联清理订阅 & 禁用无人订阅宿舍）
+        const res = await deleteUser(env.DB, user.uid);
+        return json({ ok: true, ...res }); // { ok:true, deleted:1, disabledTargets:N }
     }
 
     return new Response("Not Found", { status: 404 });

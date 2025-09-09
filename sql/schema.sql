@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS crawl_targets (
 );
 
 /*
-npx wrangler d1 execute dormdb --remote --file=./schema.sql
+npx wrangler d1 execute dormdb --remote --file=./sql/schema.sql
 */
 
 CREATE TABLE IF NOT EXISTS crawl_jobs (
@@ -32,13 +32,15 @@ CREATE TABLE IF NOT EXISTS readings (
   ts INTEGER NOT NULL,
   kwh REAL NOT NULL,
   ok INTEGER DEFAULT 1,
-  UNIQUE(hashed_dir, ts) -- unique constraint, duplications would be ignored/error
+  UNIQUE(hashed_dir, ts), -- unique constraint, duplications would be ignored/error
+  FOREIGN KEY (hashed_dir) REFERENCES crawl_targets(hashed_dir) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS dorm_latest (
   hashed_dir TEXT PRIMARY KEY,
   last_ts INTEGER NOT NULL,
-  last_kwh REAL NOT NULL
+  last_kwh REAL NOT NULL,
+  FOREIGN KEY (hashed_dir) REFERENCES crawl_targets(hashed_dir) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS crawl_failures (
@@ -46,7 +48,8 @@ CREATE TABLE IF NOT EXISTS crawl_failures (
   job_id TEXT NOT NULL,
   hashed_dir TEXT NOT NULL,
   reason TEXT NOT NULL,
-  ts INTEGER NOT NULL
+  ts INTEGER NOT NULL,
+  FOREIGN KEY (hashed_dir) REFERENCES crawl_targets(hashed_dir) ON DELETE CASCADE
 );
 
 -- 用户表（邮箱登录）
@@ -61,12 +64,13 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS subscriptions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT NOT NULL,
-  hashed_dir TEXT NOT NULL,            -- 宿舍主键（HMAC(canonical_id)）
-  canonical_id TEXT NOT NULL,          -- 明文宿舍号（你允许持有）
+  hashed_dir TEXT NOT NULL,
+  canonical_id TEXT NOT NULL,
   email_alert INTEGER NOT NULL DEFAULT 0,
   created_ts INTEGER NOT NULL,
   UNIQUE(user_id, hashed_dir),
-  FOREIGN KEY(user_id) REFERENCES users(id)
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (hashed_dir) REFERENCES crawl_targets(hashed_dir) ON DELETE CASCADE
 );
 
 -- 触发器：限制同一用户最多 3 个订阅

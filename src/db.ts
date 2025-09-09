@@ -298,22 +298,96 @@ export async function deleteSubscriptionAndMaybeDisableTarget(
     }
 }
 
+export async function getSeriesForUser(
+  db: D1Database,
+  user_id: string,
+  hashed_dir: string,
+  since: number,
+  limit: number
+) {
+  // 只有在用户确实订阅了该 hashed_dir 时才返回数据；否则返回空数组
+  const r = await db
+    .prepare(
+      "SELECT r.ts, r.kwh FROM readings r " +
+      "WHERE r.hashed_dir=?1 AND r.ts>=?2 " +
+      "  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id=?3 AND s.hashed_dir=?1) " +
+      "ORDER BY r.ts ASC " +
+      "LIMIT ?4"
+    )
+    .bind(hashed_dir, since, user_id, limit)
+    .all();
+
+  // 如果没有订阅，结果会是空数组；为区分“真没订阅”与“有订阅但没数据”，再查一次订阅存在性
+  if ((r.results as any[]).length === 0) {
+    const sub = await db
+      .prepare("SELECT 1 FROM subscriptions WHERE user_id=?1 AND hashed_dir=?2 LIMIT 1")
+      .bind(user_id, hashed_dir)
+      .all();
+    if ((sub.results as any[]).length === 0) return { forbidden: true, points: [] };
+  }
+  return { forbidden: false, points: r.results as { ts: number; kwh: number }[] };
+}
+
 // 查询某宿舍的时序点（供前端绘图）
-export async function getSeries(
-    db: D1Database,
-    hashed_dir: string,
-    since: number,
-    limit: number
-): Promise<SeriesPoint[]> {
-    const r = await db
-        .prepare(
-            "SELECT ts, kwh FROM readings " +
-                "WHERE hashed_dir=?1 AND ts>=?2 " +
-                "ORDER BY ts ASC " +
-                "LIMIT ?3"
-        )
-        .bind(hashed_dir, since, limit)
-        .all();
-    console.log("getSeries", r.results)
-    return r.results as unknown as SeriesPoint[];
+// export async function getSeries(
+//     db: D1Database,
+//     hashed_dir: string,
+//     since: number,
+//     limit: number
+// ): Promise<SeriesPoint[]> {
+//     const r = await db
+//         .prepare(
+//             "SELECT ts, kwh FROM readings " +
+//                 "WHERE hashed_dir=?1 AND ts>=?2 " +
+//                 "ORDER BY ts ASC " +
+//                 "LIMIT ?3"
+//         )
+//         .bind(hashed_dir, since, limit)
+//         .all();
+//     console.log("getSeries", r.results)
+//     return r.results as unknown as SeriesPoint[];
+// }
+
+export async function getUserById(db: D1Database, id: string): Promise<DbUser | null> {
+  const r = await db
+    .prepare("SELECT id, email, pw_hash, created_ts FROM users WHERE id=?1")
+    .bind(id)
+    .all();
+  const row = (r.results as any[])[0];
+  return row
+    ? { id: row.id, email: row.email, pw_hash: row.pw_hash, created_ts: row.created_ts }
+    : null;
+}
+
+export async function deleteUser(db: D1Database, user_id: string): Promise<{deleted: number; disabledTargets: number}> {
+  // 1) 删除用户（触发 subscriptions 级联删除）
+  const del = await db
+    .prepare("DELETE FROM users WHERE id=?1")
+    .bind(user_id)
+    .run();
+
+  // 2) 将“无人订阅”的目标禁用（不物理删除，以便保留历史 readings）
+  const upd = await db
+    .prepare(
+      "UPDATE crawl_targets " +
+      "SET enabled=0 " +
+      "WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.hashed_dir = crawl_targets.hashed_dir)"
+    )
+    .run();
+
+  return {
+    deleted: del.meta.changes ?? 0,
+    disabledTargets: upd.meta.changes ?? 0,
+  };
+}
+
+export async function deleteUserByEmail(db: D1Database, email: string): Promise<{deleted: number; disabledTargets: number}> {
+  // 查 id，再调上面的 deleteUser
+  const r = await db
+    .prepare("SELECT id FROM users WHERE email=?1")
+    .bind(email)
+    .all();
+  const row = (r.results as any[])[0];
+  if (!row) return { deleted: 0, disabledTargets: 0 };
+  return deleteUser(db, row.id);
 }
