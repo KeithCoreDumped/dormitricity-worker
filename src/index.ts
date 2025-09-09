@@ -9,7 +9,7 @@ import {
     listSubscriptionsWithLatest,
     updateSubscriptionAlert,
     deleteSubscriptionAndMaybeDisableTarget,
-    // getSeries,
+    getLatest,
     getSeriesForUser,
     getUserById,
     deleteUser,
@@ -250,9 +250,12 @@ const route = async (req: Request, env: Env) => {
             isNaN(since) ? 0 : since,
             limit
         );
-        if (forbidden) return json({ error: "NOT_FOUND_OR_EMPTY" }, 404);
 
-        return json({ hashed_dir: hashed, points });
+        const result = await getLatest(env.DB, user.uid, hashed);
+
+        if (forbidden || result === null) return json({ error: "NOT_FOUND_OR_EMPTY" }, 404);
+
+        return json({ hashed_dir: hashed, points, latest: result });
     }
 
     if (pathname === "/auth/delete" && req.method === "POST") {

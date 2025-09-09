@@ -267,6 +267,47 @@ export async function listSubscriptionsWithLatest(
     return r.results as unknown as SubscriptionRow[];
 }
 
+export async function getLatest(
+    db: D1Database,
+    user_id: string,
+    hashed_dir: string
+) {
+    const r = await db
+        .prepare(
+            `SELECT last_ts, last_kwh, last_kw
+             FROM dorm_latest
+             WHERE hashed_dir=?1`
+        )
+        .bind(hashed_dir)
+        .all();
+    console.log("getLatest:", r.results);
+    const results = r.results as unknown as {
+        last_ts: number;
+        last_kwh: number;
+        last_kw: number;
+    }[];
+
+    if (results.length === 0)
+        return null;
+    else return results[0]!;
+}
+
+export async function verifySubscription(
+    db: D1Database,
+    user_id: string,
+    hashed_dir: string
+) {
+    const sub = await db
+        .prepare(
+            "SELECT 1 FROM subscriptions WHERE user_id=?1 AND hashed_dir=?2 LIMIT 1"
+        )
+        .bind(user_id, hashed_dir)
+        .all();
+    if ((sub.results as any[]).length === 0)
+        return false; // the user does not have such subscription
+    else return true;
+}
+
 // 更新订阅提醒标志
 export async function updateSubscriptionAlert(
     db: D1Database,
@@ -335,6 +376,7 @@ export async function getSeriesForUser(
             .all();
         if ((sub.results as any[]).length === 0)
             return { forbidden: true, points: [] };
+        else return { forbidden: false, points: [] };
     }
     return {
         forbidden: false,
