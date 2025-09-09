@@ -82,8 +82,6 @@ export async function ingestBatch(db: D1Database, body: any) {
     const jobId = body.job_id as string;
     const idx = body.slice_index as number;
 
-    console.log(`ingestBatch: got readings of length ${readings.length}`);
-
     const stmts = [];
     for (const r of readings) {
         stmts.push(

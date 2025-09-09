@@ -79,7 +79,7 @@ const route = async (req: Request, env: Env) => {
         return new Response("scheduled() triggered manually");
     }
 
-    if (url.pathname === "/orchestrator/claim" && req.method === "POST") {
+    if (url.pathname === "/crawler/claim" && req.method === "POST") {
         const token = (req.headers.get("authorization") || "").replace(
             /^Bearer\s+/i,
             ""
@@ -113,7 +113,7 @@ const route = async (req: Request, env: Env) => {
             */
     }
 
-    if (url.pathname === "/ingest" && req.method === "POST") {
+    if (url.pathname === "/crawler/ingest" && req.method === "POST") {
         const token = (req.headers.get("authorization") || "").replace(
             /^Bearer\s+/i,
             ""
@@ -122,7 +122,6 @@ const route = async (req: Request, env: Env) => {
         if (!payload.scope?.includes("ingest"))
             return new Response("forbidden", { status: 403 });
 
-        // const body = await req.json();
         const body = (await req.json()) as { job_id: string };
         if (payload.job_id !== body.job_id)
             return new Response("bad job", { status: 400 });
@@ -255,21 +254,6 @@ const route = async (req: Request, env: Env) => {
 
         return json({ hashed_dir: hashed, points });
     }
-    // if (pathname.startsWith("/series/") && req.method === "GET") {
-    //     const hashed = pathname.split("/").pop()!;
-    //     const since = parseInt(searchParams.get("since") || "0", 10);
-    //     const limit = Math.min(
-    //         parseInt(searchParams.get("limit") || "1000", 10),
-    //         5000
-    //     );
-    //     const points = await getSeries(
-    //         env.DB,
-    //         hashed,
-    //         isNaN(since) ? 0 : since,
-    //         limit
-    //     );
-    //     return json({ hashed_dir: hashed, points });
-    // }
 
     if (pathname === "/auth/delete" && req.method === "POST") {
         const user = await requireUser(req, env);
