@@ -1,4 +1,5 @@
 import type { Target, SeriesPoint, SubscriptionRow } from "./types.js";
+import { estimate } from "./estimate.js";
 
 export async function fetchEnabledTargets(db: D1Database): Promise<Target[]> {
     const r = await db
@@ -84,6 +85,11 @@ export async function ingestBatch(db: D1Database, body: any) {
 
     const stmts = [];
     for (const r of readings) {
+        // fetch series of last 24 hours for estimation
+        const recent = await getSeries(db, r.hashed_dir, r.ts - 24 * 3600, 200);
+        const kw = estimate(recent);
+        const last_kw = kw ? kw.kw : null;
+        console.log(`estimate kw of ${r.hashed_dir}: ${kw}`);
         stmts.push(
             db
                 .prepare(
@@ -94,10 +100,14 @@ export async function ingestBatch(db: D1Database, body: any) {
         stmts.push(
             db
                 .prepare(
-                    "INSERT INTO dorm_latest (hashed_dir, last_ts, last_kwh) VALUES (?1,?2,?3) " +
-                        "ON CONFLICT(hashed_dir) DO UPDATE SET last_ts=excluded.last_ts, last_kwh=excluded.last_kwh"
+                    `INSERT INTO dorm_latest (hashed_dir, last_ts, last_kwh, last_kw)
+                     VALUES (?1,?2,?3,?4)
+                     ON CONFLICT(hashed_dir) DO UPDATE
+                     SET last_ts  = excluded.last_ts,
+                         last_kwh = excluded.last_kwh,
+                         last_kw  = excluded.last_kw`
                 )
-                .bind(r.hashed_dir, r.ts, r.kwh)
+                .bind(r.hashed_dir, r.ts, r.kwh, last_kw)
         );
         stmts.push(
             db
@@ -244,16 +254,16 @@ export async function listSubscriptionsWithLatest(
 ): Promise<SubscriptionRow[]> {
     const r = await db
         .prepare(
-            "SELECT s.hashed_dir, s.canonical_id, s.email_alert, s.created_ts, " +
-                "       dl.last_ts, dl.last_kwh " +
-                "FROM subscriptions s " +
-                "LEFT JOIN dorm_latest dl ON dl.hashed_dir = s.hashed_dir " +
-                "WHERE s.user_id=?1 " +
-                "ORDER BY s.created_ts DESC"
+            `SELECT s.hashed_dir, s.canonical_id, s.email_alert, s.created_ts,
+                    dl.last_ts, dl.last_kwh, dl.last_kw
+             FROM subscriptions s
+             LEFT JOIN dorm_latest dl ON dl.hashed_dir = s.hashed_dir
+             WHERE s.user_id=?1
+             ORDER BY s.created_ts DESC`
         )
         .bind(user_id)
         .all();
-    console.log("listSubscriptionsWithLatest:", r.results)
+    console.log("listSubscriptionsWithLatest:", r.results);
     return r.results as unknown as SubscriptionRow[];
 }
 
@@ -297,95 +307,115 @@ export async function deleteSubscriptionAndMaybeDisableTarget(
 }
 
 export async function getSeriesForUser(
-  db: D1Database,
-  user_id: string,
-  hashed_dir: string,
-  since: number,
-  limit: number
+    db: D1Database,
+    user_id: string,
+    hashed_dir: string,
+    since: number,
+    limit: number
 ) {
-  // 只有在用户确实订阅了该 hashed_dir 时才返回数据；否则返回空数组
-  const r = await db
-    .prepare(
-      "SELECT r.ts, r.kwh FROM readings r " +
-      "WHERE r.hashed_dir=?1 AND r.ts>=?2 " +
-      "  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id=?3 AND s.hashed_dir=?1) " +
-      "ORDER BY r.ts ASC " +
-      "LIMIT ?4"
-    )
-    .bind(hashed_dir, since, user_id, limit)
-    .all();
+    // 只有在用户确实订阅了该 hashed_dir 时才返回数据；否则返回空数组
+    const r = await db
+        .prepare(
+            "SELECT r.ts, r.kwh FROM readings r " +
+                "WHERE r.hashed_dir=?1 AND r.ts>=?2 " +
+                "  AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id=?3 AND s.hashed_dir=?1) " +
+                "ORDER BY r.ts ASC " +
+                "LIMIT ?4"
+        )
+        .bind(hashed_dir, since, user_id, limit)
+        .all();
 
-  // 如果没有订阅，结果会是空数组；为区分“真没订阅”与“有订阅但没数据”，再查一次订阅存在性
-  if ((r.results as any[]).length === 0) {
-    const sub = await db
-      .prepare("SELECT 1 FROM subscriptions WHERE user_id=?1 AND hashed_dir=?2 LIMIT 1")
-      .bind(user_id, hashed_dir)
-      .all();
-    if ((sub.results as any[]).length === 0) return { forbidden: true, points: [] };
-  }
-  return { forbidden: false, points: r.results as { ts: number; kwh: number }[] };
+    // 如果没有订阅，结果会是空数组；为区分“真没订阅”与“有订阅但没数据”，再查一次订阅存在性
+    if ((r.results as any[]).length === 0) {
+        const sub = await db
+            .prepare(
+                "SELECT 1 FROM subscriptions WHERE user_id=?1 AND hashed_dir=?2 LIMIT 1"
+            )
+            .bind(user_id, hashed_dir)
+            .all();
+        if ((sub.results as any[]).length === 0)
+            return { forbidden: true, points: [] };
+    }
+    return {
+        forbidden: false,
+        points: r.results as { ts: number; kwh: number }[],
+    };
 }
 
-// 查询某宿舍的时序点（供前端绘图）
-// export async function getSeries(
-//     db: D1Database,
-//     hashed_dir: string,
-//     since: number,
-//     limit: number
-// ): Promise<SeriesPoint[]> {
-//     const r = await db
-//         .prepare(
-//             "SELECT ts, kwh FROM readings " +
-//                 "WHERE hashed_dir=?1 AND ts>=?2 " +
-//                 "ORDER BY ts ASC " +
-//                 "LIMIT ?3"
-//         )
-//         .bind(hashed_dir, since, limit)
-//         .all();
-//     console.log("getSeries", r.results)
-//     return r.results as unknown as SeriesPoint[];
-// }
-
-export async function getUserById(db: D1Database, id: string): Promise<DbUser | null> {
-  const r = await db
-    .prepare("SELECT id, email, pw_hash, created_ts FROM users WHERE id=?1")
-    .bind(id)
-    .all();
-  const row = (r.results as any[])[0];
-  return row
-    ? { id: row.id, email: row.email, pw_hash: row.pw_hash, created_ts: row.created_ts }
-    : null;
+// for estimation
+async function getSeries(
+    db: D1Database,
+    hashed_dir: string,
+    since: number,
+    limit: number
+): Promise<SeriesPoint[]> {
+    const r = await db
+        .prepare(
+            "SELECT ts, kwh FROM readings " +
+                "WHERE hashed_dir=?1 AND ts>=?2 " +
+                "ORDER BY ts ASC " +
+                "LIMIT ?3"
+        )
+        .bind(hashed_dir, since, limit)
+        .all();
+    // console.log("getSeries", r.results)
+    return r.results as unknown as SeriesPoint[];
 }
 
-export async function deleteUser(db: D1Database, user_id: string): Promise<{deleted: number; disabledTargets: number}> {
-  // 1) 删除用户（触发 subscriptions 级联删除）
-  const del = await db
-    .prepare("DELETE FROM users WHERE id=?1")
-    .bind(user_id)
-    .run();
-
-  // 2) 将“无人订阅”的目标禁用（不物理删除，以便保留历史 readings）
-  const upd = await db
-    .prepare(
-      "UPDATE crawl_targets " +
-      "SET enabled=0 " +
-      "WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.hashed_dir = crawl_targets.hashed_dir)"
-    )
-    .run();
-
-  return {
-    deleted: del.meta.changes ?? 0,
-    disabledTargets: upd.meta.changes ?? 0,
-  };
+export async function getUserById(
+    db: D1Database,
+    id: string
+): Promise<DbUser | null> {
+    const r = await db
+        .prepare("SELECT id, email, pw_hash, created_ts FROM users WHERE id=?1")
+        .bind(id)
+        .all();
+    const row = (r.results as any[])[0];
+    return row
+        ? {
+              id: row.id,
+              email: row.email,
+              pw_hash: row.pw_hash,
+              created_ts: row.created_ts,
+          }
+        : null;
 }
 
-export async function deleteUserByEmail(db: D1Database, email: string): Promise<{deleted: number; disabledTargets: number}> {
-  // 查 id，再调上面的 deleteUser
-  const r = await db
-    .prepare("SELECT id FROM users WHERE email=?1")
-    .bind(email)
-    .all();
-  const row = (r.results as any[])[0];
-  if (!row) return { deleted: 0, disabledTargets: 0 };
-  return deleteUser(db, row.id);
+export async function deleteUser(
+    db: D1Database,
+    user_id: string
+): Promise<{ deleted: number; disabledTargets: number }> {
+    // 1) 删除用户（触发 subscriptions 级联删除）
+    const del = await db
+        .prepare("DELETE FROM users WHERE id=?1")
+        .bind(user_id)
+        .run();
+
+    // 2) 将“无人订阅”的目标禁用（不物理删除，以便保留历史 readings）
+    const upd = await db
+        .prepare(
+            "UPDATE crawl_targets " +
+                "SET enabled=0 " +
+                "WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.hashed_dir = crawl_targets.hashed_dir)"
+        )
+        .run();
+
+    return {
+        deleted: del.meta.changes ?? 0,
+        disabledTargets: upd.meta.changes ?? 0,
+    };
+}
+
+export async function deleteUserByEmail(
+    db: D1Database,
+    email: string
+): Promise<{ deleted: number; disabledTargets: number }> {
+    // 查 id，再调上面的 deleteUser
+    const r = await db
+        .prepare("SELECT id FROM users WHERE email=?1")
+        .bind(email)
+        .all();
+    const row = (r.results as any[])[0];
+    if (!row) return { deleted: 0, disabledTargets: 0 };
+    return deleteUser(db, row.id);
 }

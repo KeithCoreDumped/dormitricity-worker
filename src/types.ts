@@ -30,4 +30,5 @@ export interface SubscriptionRow {
     created_ts: number;
     last_ts?: number | null;
     last_kwh?: number | null;
+    last_kw?: number | null;
 }
