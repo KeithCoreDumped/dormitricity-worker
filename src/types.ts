@@ -22,13 +22,22 @@ export interface SeriesPoint {
     kwh: number;
 }
 
+export type NotifyChannel = 'none' | 'wxwork' | 'feishu' | 'serverchan';
 
 export interface SubscriptionRow {
     hashed_dir: string;
     canonical_id: string;
-    email_alert: number;
     created_ts: number;
     last_ts?: number | null;
     last_kwh?: number | null;
     last_kw?: number | null;
 }
+
+export type RuleType = 'low_kwh' | 'deplete';
+
+export interface SetAlertOptions {
+  threshold_kwh?: number;   // 仅 low_kwh 用
+  within_hours?: number;    // 仅 deplete 用
+  cooldown_sec?: number;    // 建议 >= 43200 (12h)
+}
+

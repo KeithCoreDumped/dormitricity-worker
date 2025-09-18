@@ -1,4 +1,4 @@
-import type { Target, SeriesPoint, SubscriptionRow } from "./types.js";
+import type { Target, SeriesPoint, SubscriptionRow, RuleType, SetAlertOptions, NotifyChannel as Channel } from "./types.js";
 import { estimate } from "./estimate.js";
 
 export async function fetchEnabledTargets(db: D1Database): Promise<Target[]> {
@@ -235,15 +235,14 @@ export async function insertSubscription(
     user_id: string,
     hashed_dir: string,
     canonical_id: string,
-    email_alert: boolean
 ) {
     const now = Math.floor(Date.now() / 1000);
     await db
         .prepare(
-            "INSERT INTO subscriptions (user_id, hashed_dir, canonical_id, email_alert, created_ts) " +
-                "VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO subscriptions (user_id, hashed_dir, canonical_id, created_ts) " +
+                "VALUES (?1, ?2, ?3, ?4)"
         )
-        .bind(user_id, hashed_dir, canonical_id, email_alert ? 1 : 0, now)
+        .bind(user_id, hashed_dir, canonical_id, now)
         .run();
 }
 
@@ -254,7 +253,7 @@ export async function listSubscriptionsWithLatest(
 ): Promise<SubscriptionRow[]> {
     const r = await db
         .prepare(
-            `SELECT s.hashed_dir, s.canonical_id, s.email_alert, s.created_ts,
+            `SELECT s.hashed_dir, s.canonical_id, s.created_ts,
                     dl.last_ts, dl.last_kwh, dl.last_kw
              FROM subscriptions s
              LEFT JOIN dorm_latest dl ON dl.hashed_dir = s.hashed_dir
@@ -308,20 +307,19 @@ export async function verifySubscription(
     else return true;
 }
 
-// 更新订阅提醒标志
-export async function updateSubscriptionAlert(
-    db: D1Database,
-    user_id: string,
-    hashed_dir: string,
-    email_alert: boolean
-) {
-    await db
-        .prepare(
-            "UPDATE subscriptions SET email_alert=?3 WHERE user_id=?1 AND hashed_dir=?2"
-        )
-        .bind(user_id, hashed_dir, email_alert ? 1 : 0)
-        .run();
-}
+// // 更新订阅提醒标志
+// export async function updateSubscriptionAlert(
+//     db: D1Database,
+//     user_id: string,
+//     hashed_dir: string,
+// ) {
+//     await db
+//         .prepare(
+//             "UPDATE subscriptions SET WHERE user_id=?1 AND hashed_dir=?2"
+//         )
+//         .bind(user_id, hashed_dir)
+//         .run();
+// }
 
 // 取消订阅；若无人订阅该宿舍则自动禁用爬取
 export async function deleteSubscriptionAndMaybeDisableTarget(
@@ -461,3 +459,200 @@ export async function deleteUserByEmail(
     if (!row) return { deleted: 0, disabledTargets: 0 };
     return deleteUser(db, row.id);
 }
+
+// for notify
+async function getSubscriptionId(
+  db: D1Database,
+  user_id: string,
+  hashed_dir: string
+): Promise<number | null> {
+  const res = await db
+    .prepare(
+      `SELECT id FROM subscriptions
+       WHERE user_id = ?1 AND hashed_dir = ?2
+       LIMIT 1`
+    )
+    .bind(user_id, hashed_dir)
+    .first<{ id: number }>();
+  return res?.id ?? null;
+}
+
+/**
+ * 设置/更新订阅规则（无需暴露 subscription_id）。
+ * - rule_type: 'low_kwh' | 'deplete'
+ * - options: 仅对相应字段生效；未提供则不改动（更新场景）
+ * - 若该类型规则不存在则插入；存在则更新
+ */
+export async function setAlertRuleByKey(
+  db: D1Database,
+  user_id: string,
+  hashed_dir: string,
+  rule_type: RuleType,
+  options: SetAlertOptions
+) {
+  const subId = await getSubscriptionId(db, user_id, hashed_dir);
+  if (!subId) {
+    throw new Error('Subscription not found for given user_id and hashed_dir');
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const cooldown = options.cooldown_sec ?? 43200; // 默认 12h
+
+  // 先尝试 UPDATE（存在则更新，不存在则插入）
+  const update = await db
+    .prepare(
+      `UPDATE subscription_alerts
+         SET threshold_kwh = CASE
+                               WHEN ?2 IS NULL THEN threshold_kwh
+                               ELSE ?2
+                             END,
+             within_hours = CASE
+                               WHEN ?3 IS NULL THEN within_hours
+                               ELSE ?3
+                             END,
+             cooldown_sec = COALESCE(?4, cooldown_sec),
+             updated_ts = ?5
+       WHERE subscription_id = ?1 AND rule_type = ?6`
+    )
+    .bind(
+      subId,
+      options.threshold_kwh ?? null,
+      options.within_hours ?? null,
+      cooldown,
+      now,
+      rule_type
+    )
+    .run();
+
+  if (update.meta.changes && update.meta.changes > 0) {
+    return; // 已更新
+  }
+
+  // 插入新规则（last_alert_ts=NULL）
+  await db
+    .prepare(
+      `INSERT INTO subscription_alerts
+         (subscription_id, rule_type, threshold_kwh, within_hours,
+          cooldown_sec, last_alert_ts, created_ts)
+       VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)`
+    )
+    .bind(
+      subId,
+      rule_type,
+      rule_type === 'low_kwh' ? (options.threshold_kwh ?? null) : null,
+      rule_type === 'deplete' ? (options.within_hours ?? null) : null,
+      cooldown,
+      now
+    )
+    .run();
+}
+
+/** 关闭某类型规则（删除该规则行） */
+export async function disableAlertRuleByKey(
+  db: D1Database,
+  user_id: string,
+  hashed_dir: string,
+  rule_type: RuleType
+) {
+  const subId = await getSubscriptionId(db, user_id, hashed_dir);
+  if (!subId) return; // 没有订阅直接视为已关闭
+
+  await db
+    .prepare(
+      `DELETE FROM subscription_alerts
+       WHERE subscription_id = ?1 AND rule_type = ?2`
+    )
+    .bind(subId, rule_type)
+    .run();
+}
+
+/**
+ * 规范化各通道的 token 输入：
+ * - wxwork：允许 key 或完整 webhook URL；返回建议存储为「完整 URL」
+ * - feishu：允许完整 webhook URL 或 token；返回建议存储为「token」
+ * - serverchan：允许完整 URL 或 SendKey；返回建议存储为「SendKey」
+ * - none：返回 null
+ */
+function normalizeTokenForChannel(channel: Channel, raw?: string | null): string | null {
+  if (channel === 'none') return null;
+
+  const token = (raw ?? '').trim();
+  if (!token) throw new Error('TOKEN_REQUIRED');
+
+  if (channel === 'wxwork') {
+    // 如果是 key，转成完整 URL 存储；如果已经是 URL，直接存
+    if (/^https?:\/\//i.test(token)) return token;
+    return `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${encodeURIComponent(token)}`;
+  }
+
+  if (channel === 'feishu') {
+    // 只存 token。若传的是完整 URL，从 URL 中提取 token
+    if (/^https?:\/\//i.test(token)) {
+      // 形如 https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>
+      const m = token.match(/\/hook\/([A-Za-z0-9\-_]+)/);
+      if (!m) throw new Error('FEISHU_TOKEN_PARSE_FAILED');
+      return m[1] ?? null;
+    }
+    return token; // 已是 token
+  }
+
+  if (channel === 'serverchan') {
+    // 只存 SendKey（通常以 SCT 开头）。若传的是完整 URL，从 URL 里提取
+    if (/^https?:\/\//i.test(token)) {
+      // 形如 https://sctapi.ftqq.com/<SCTKEY>.send
+      const m = token.match(/sctapi\.ftqq\.com\/([^./]+)\.send/i);
+      if (!m) throw new Error('SERVERCHAN_SENDKEY_PARSE_FAILED');
+      return m[1] ?? null;
+    }
+    return token; // 已是 SendKey
+  }
+
+  // 理论上不会到这
+  return token || null;
+}
+
+/**
+ * 更新单通道通知配置（通过 user_id + hashed_dir）。
+ * - channel = 'none' 时会清空 notify_token
+ * - 其他通道会对 token 做轻度规范化（见上）
+ * - 若订阅不存在，抛出 "Subscription not found for given user_id and hashed_dir"
+ * - 对于缺少 token 的情况抛出 "TOKEN_REQUIRED"
+ */
+export async function updateNotifyChannel(
+  db: D1Database,
+  user_id: string,
+  hashed_dir: string,
+  channel: Channel,
+  token?: string | null
+): Promise<void> {
+  // 基本校验
+  if (!user_id || !hashed_dir) throw new Error('BAD_ARGUMENTS');
+  if (!['none', 'wxwork', 'feishu', 'serverchan'].includes(channel)) {
+    throw new Error('INVALID_CHANNEL');
+  }
+
+  // 规范化 token（含必要性校验）
+  let tokenToStore: string | null;
+  try {
+    tokenToStore = normalizeTokenForChannel(channel, token ?? null);
+  } catch (e: any) {
+    // 往上抛，让路由按需要映射为 400
+    throw e;
+  }
+
+  // 执行更新
+  const res = await db
+    .prepare(
+      `UPDATE subscriptions
+         SET notify_channel = ?3,
+             notify_token   = ?4
+       WHERE user_id = ?1 AND hashed_dir = ?2`
+    )
+    .bind(user_id, hashed_dir, channel, tokenToStore)
+    .run();
+
+  if (!res.meta.changes || res.meta.changes === 0) {
+    throw new Error('Subscription not found for given user_id and hashed_dir');
+  }
+}
+
