@@ -103,34 +103,17 @@ CREATE INDEX IF NOT EXISTS idx_subs_hdir     ON subscriptions(hashed_dir);
 CREATE INDEX IF NOT EXISTS idx_subs_user     ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subs_user_chan ON subscriptions(user_id, notify_channel);
 
+
 -- ////////////////// notify 规则表 //////////////////////////////
--- 一条规则一行；同一个 subscription 可以有 'low_kwh' 与 'deplete' 各一条
-CREATE TABLE IF NOT EXISTS subscription_alerts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  subscription_id INTEGER NOT NULL,
+-- ALTER TABLE subscriptions DROP COLUMN threshold_kwh;
+-- ALTER TABLE subscriptions DROP COLUMN within_hours;
+-- ALTER TABLE subscriptions DROP COLUMN last_alert_ts;
+ALTER TABLE subscriptions
+  ADD COLUMN threshold_kwh REAL NOT NULL DEFAULT 0.0;  -- 低电量规则用; 0 -> disabled
+ALTER TABLE subscriptions
+  ADD COLUMN within_hours REAL NOT NULL DEFAULT 0.0;   -- 耗尽规则用;   0 -> disabled
+ALTER TABLE subscriptions
+  ADD COLUMN last_alert_ts INTEGER NOT NULL DEFAULT 0; -- 最近一次发送
 
-  rule_type TEXT NOT NULL
-    CHECK (rule_type IN ('low_kwh','deplete')),
-
-  -- 规则参数（按类型使用；未用置 NULL）
-  threshold_kwh REAL,       -- 低电量规则用
-  within_hours REAL,        -- 耗尽规则用
-
-  -- 冷却：>= 12h（43200s）
-  cooldown_sec INTEGER NOT NULL DEFAULT 43200
-    CHECK (cooldown_sec >= 43200),
-
-  -- 去重/边沿状态
-  last_alert_ts INTEGER,          -- 最近一次发送
-
-  created_ts INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-  updated_ts INTEGER,
-
-  UNIQUE(subscription_id, rule_type),
-  FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
-);
-
--- 索引：按订阅查规则；按类型做统计/筛选
-CREATE INDEX IF NOT EXISTS idx_alerts_sub  ON subscription_alerts(subscription_id);
-CREATE INDEX IF NOT EXISTS idx_alerts_type ON subscription_alerts(rule_type);
-
+ALTER TABLE subscriptions
+  ADD COLUMN cooldown_sec INTEGER NOT NULL DEFAULT 43200; -- cooldown window in seconds (default 12h)

@@ -13,12 +13,15 @@ import {
     getSeriesForUser,
     getUserById,
     deleteUser,
-    setAlertRuleByKey,
-    disableAlertRuleByKey,
-    updateNotifyChannel
+    // setAlertRuleByKey,
+    // disableAlertRuleByKey,
+    // updateNotifyChannel,
+    updateSubscriptionNotify,
+    verifySubscription,
 } from "./db.js";
 import { dispatchWorkflow } from "./github.js";
-import type { Env, Target } from "./types.js";
+import { sendTestNotification } from "./notify.js";
+import type { Env, NotifyChannel, Target } from "./types.js";
 import { hashPassword, verifyPassword, signUser, verifyUser } from "./auth.js";
 import { hmacDorm } from "./hmac.js";
 import { ALLOW_ORIGINS, buildCorsHeaders, isPreflight } from "./cors.js";
@@ -177,6 +180,8 @@ const route = async (req: Request, env: Env) => {
         const token = await signUser(env, { uid: row.id, email });
         return json({ token });
     }
+
+    // list subscriptions
     if (pathname === "/subs" && req.method === "GET") {
         const user = await requireUser(req, env);
         if (!user) return json({ error: "UNAUTHORIZED" }, 401);
@@ -184,6 +189,7 @@ const route = async (req: Request, env: Env) => {
         return json({ items });
     }
 
+    // add subscription
     if (pathname === "/subs" && req.method === "POST") {
         const user = await requireUser(req, env);
         if (!user) return json({ error: "UNAUTHORIZED" }, 401);
@@ -196,12 +202,7 @@ const route = async (req: Request, env: Env) => {
         try {
             await Promise.all([
                 ensureTargetEnabled(env.DB, hashed, canonical_id),
-                insertSubscription(
-                    env.DB,
-                    user.uid,
-                    hashed,
-                    canonical_id,
-                ),
+                insertSubscription(env.DB, user.uid, hashed, canonical_id),
             ]);
         } catch (e: any) {
             const msg = String(e?.message || e);
@@ -214,22 +215,112 @@ const route = async (req: Request, env: Env) => {
         return json({ ok: true, hashed_dir: hashed });
     }
 
-    // deprecated, removing soon
+    // subscription settings
     if (pathname.startsWith("/subs/") && req.method === "PUT") {
         const user = await requireUser(req, env);
         if (!user) return json({ error: "UNAUTHORIZED" }, 401);
         const hashed = pathname.split("/").pop()!;
-        // await updateSubscriptionAlert(env.DB, user.uid, hashed);
-        console.warn(`in PUT /subs/${hashed}`)
-        return json({ ok: false }, 400);
+        if (!verifySubscription(env.DB, user.uid, hashed)) {
+            return json(
+                {
+                    error: "BAD_REQUEST",
+                    detail: "The user does not have the subscription specified",
+                },
+                400
+            );
+        }
+        const { threshold_kwh, within_hours, notify_channel, notify_token, cooldown_sec } =
+            await parseJSON<{
+                threshold_kwh?: number;
+                within_hours?: number;
+                notify_channel?: NotifyChannel;
+                notify_token?: string;
+                cooldown_sec?: number;
+            }>(req);
+
+        if (threshold_kwh === undefined || within_hours === undefined || !notify_channel || cooldown_sec === undefined) {
+            return json(
+                {
+                    error: "BAD_REQUEST",
+                    detail: "threshold_kwh, within_hours, cooldown_sec and notify_channel are required",
+                },
+                400
+            );
+        }
+
+        const allowedCooldowns = [43200, 64800, 86400, 172800];
+        if (!allowedCooldowns.includes(cooldown_sec)) {
+            return json(
+                {
+                    error: "BAD_REQUEST",
+                    detail: "Invalid cooldown_sec value",
+                },
+                400
+            );
+        }
+
+        if (notify_channel != "none" && !notify_token) {
+            return json(
+                {
+                    error: "BAD_REQUEST",
+                    detail: "notify_token required",
+                },
+                400
+            );
+        }
+
+        // TODO: check token/channel integrity
+        try {
+            await updateSubscriptionNotify(
+                env.DB,
+                user.uid,
+                hashed,
+                threshold_kwh,
+                within_hours,
+                cooldown_sec,
+                notify_channel,
+                notify_token
+            );
+        } catch (e: any) {
+            return json(
+                { error: "ERROR", detail: String(e?.message || e) },
+                500
+            );
+        }
+        return json({ ok: true });
     }
 
+    // delete subscription
     if (pathname.startsWith("/subs/") && req.method === "DELETE") {
         const user = await requireUser(req, env);
         if (!user) return json({ error: "UNAUTHORIZED" }, 401);
         const hashed = pathname.split("/").pop()!;
         await deleteSubscriptionAndMaybeDisableTarget(env.DB, user.uid, hashed);
         return json({ ok: true });
+    }
+
+    // test notification
+    if (pathname.startsWith("/subs/test-notify") && req.method === "POST") {
+        const user = await requireUser(req, env);
+        if (!user) return json({ error: "UNAUTHORIZED" }, 401);
+
+        const { notify_channel, notify_token } = await parseJSON<{
+            notify_channel: NotifyChannel;
+            notify_token: string;
+        }>(req);
+
+        if (!notify_channel || !notify_token) {
+            return json(
+                {
+                    error: "BAD_REQUEST",
+                    detail: "notify_channel and notify_token are required",
+                },
+                400
+            );
+        }
+
+        const result = await sendTestNotification(notify_channel, notify_token);
+        return json(result);
     }
 
     // ========= 时序查询 =========
@@ -255,7 +346,8 @@ const route = async (req: Request, env: Env) => {
 
         const result = await getLatest(env.DB, user.uid, hashed);
 
-        if (forbidden || result === null) return json({ error: "NOT_FOUND_OR_EMPTY" }, 404);
+        if (forbidden || result === null)
+            return json({ error: "NOT_FOUND_OR_EMPTY" }, 404);
 
         return json({ hashed_dir: hashed, points, latest: result });
     }
@@ -281,104 +373,7 @@ const route = async (req: Request, env: Env) => {
         return json({ ok: true, ...res }); // { ok:true, deleted:1, disabledTargets:N }
     }
 
-    // 设置/更新订阅规则（低电量或预计耗尽）
-    //    Body:
-    //    {
-    //      "hashed_dir": "xxx",
-    //      "type": "low_kwh" | "deplete",
-    //      // low_kwh:  threshold_kwh:number,  cooldown_sec?:number
-    //      // deplete:  within_hours:number,   cooldown_sec?:number
-    //    }
-    if (pathname === "/subs/alerts" && req.method === "POST") {
-      const user = await requireUser(req, env);
-      if (!user) return json({ error: "UNAUTHORIZED" }, 401);
 
-      const body = await parseJSON<{
-        hashed_dir: string;
-        type: "low_kwh" | "deplete";
-        threshold_kwh?: number;
-        within_hours?: number;
-        cooldown_sec?: number;
-      }>(req);
-
-      const { hashed_dir, type } = body || {};
-      if (!hashed_dir || !type) {
-        return json({ error: "BAD_REQUEST", detail: "hashed_dir and type required" }, 400);
-      }
-
-      // 参数校验
-      let cooldown = body.cooldown_sec ?? 43200; // 默认 12h
-      if (!Number.isFinite(cooldown) || cooldown < 43200) cooldown = 43200;
-
-      if (type === "low_kwh") {
-        if (!Number.isFinite(body.threshold_kwh!))
-          return json({ error: "BAD_REQUEST", detail: "threshold_kwh required" }, 400);
-      } else if (type === "deplete") {
-        if (!Number.isFinite(body.within_hours!))
-          return json({ error: "BAD_REQUEST", detail: "within_hours required" }, 400);
-      }
-
-      try {
-        await setAlertRuleByKey(env.DB, user.uid, hashed_dir, type, {
-          threshold_kwh: body.threshold_kwh!!,
-          within_hours: body.within_hours!!,
-          cooldown_sec: cooldown,
-        });
-      } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (msg.includes("Subscription not found"))
-          return json({ error: "NOT_SUBSCRIBED" }, 404);
-        return json({ error: "DB_ERROR", detail: msg }, 500);
-      }
-      return json({ ok: true });
-    }
-
-    // 3) 关闭某类型规则
-    //    Body: { "hashed_dir": "xxx", "type": "low_kwh" | "deplete" }
-    if (pathname === "/subs/alerts/disable" && req.method === "POST") {
-      const user = await requireUser(req, env);
-      if (!user) return json({ error: "UNAUTHORIZED" }, 401);
-
-      const body = await parseJSON<{ hashed_dir: string; type: "low_kwh" | "deplete" }>(req);
-      const { hashed_dir, type } = body || {};
-      if (!hashed_dir || !type)
-        return json({ error: "BAD_REQUEST", detail: "hashed_dir and type required" }, 400);
-
-      try {
-        await disableAlertRuleByKey(env.DB, user.uid, hashed_dir, type);
-      } catch (e: any) {
-        return json({ error: "DB_ERROR", detail: String(e?.message || e) }, 500);
-      }
-      return json({ ok: true });
-    }
-
-    // 4) 更新通知通道（单通道）
-    //    Body: { "hashed_dir": "xxx", "channel": "none" | "wxwork" | "feishu" | "serverchan", "token"?: string }
-    if (pathname === "/subs/notify" && (req.method === "POST" || req.method === "PUT")) {
-      const user = await requireUser(req, env);
-      if (!user) return json({ error: "UNAUTHORIZED" }, 401);
-
-      const body = await parseJSON<{ hashed_dir: string; channel: "none" | "wxwork" | "feishu" | "serverchan"; token?: string | null }>(req);
-      const { hashed_dir, channel, token } = body || {};
-
-      if (!hashed_dir || !channel)
-        return json({ error: "BAD_REQUEST", detail: "hashed_dir and channel required" }, 400);
-
-      // 简单校验：当 channel != 'none' 时通常需要 token
-      if (channel !== "none" && (!token || !token.trim?.())) {
-        return json({ error: "BAD_REQUEST", detail: "token required for this channel" }, 400);
-      }
-
-      try {
-        await updateNotifyChannel(env.DB, user.uid, hashed_dir, channel, token ?? null);
-      } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (msg.includes("Subscription not found"))
-          return json({ error: "NOT_SUBSCRIBED" }, 404);
-        return json({ error: "DB_ERROR", detail: msg }, 500);
-      }
-      return json({ ok: true });
-    }
 
     return new Response("Not Found", { status: 404 });
 };
