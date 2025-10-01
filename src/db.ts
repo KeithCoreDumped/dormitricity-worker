@@ -1,5 +1,6 @@
 import type { Target, SeriesPoint, SubscriptionRow, RuleType, SetAlertOptions, NotifyChannel } from "./types.js";
 import { estimate } from "./estimate.js";
+import type { D1Database } from "@cloudflare/workers-types";
 
 export async function fetchEnabledTargets(db: D1Database): Promise<Target[]> {
     const r = await db
@@ -253,7 +254,8 @@ export async function listSubscriptionsWithLatest(
 ): Promise<SubscriptionRow[]> {
     const r = await db
         .prepare(
-            `SELECT s.hashed_dir,
+            `SELECT s.user_id,
+                    s.hashed_dir,
                     s.canonical_id,
                     s.created_ts,
                     s.notify_channel,
@@ -554,4 +556,34 @@ function normalizeTokenForChannel(channel: NotifyChannel, raw?: string | null): 
   return token || null;
 }
 
+// for notification check
+export async function getSubscriptionsForHashedDir(db: D1Database, hashed_dir: string): Promise<SubscriptionRow[]> {
+    const r = await db
+        .prepare(
+            `SELECT s.user_id, s.*, dl.last_ts, dl.last_kwh, dl.last_kw
+             FROM subscriptions s
+             JOIN dorm_latest dl ON s.hashed_dir = dl.hashed_dir
+             WHERE s.hashed_dir = ?1
+               AND s.notify_channel != 'none'
+               AND (s.threshold_kwh > 0 OR s.within_hours > 0)`
+        )
+        .bind(hashed_dir)
+        .all();
+    return r.results as unknown as SubscriptionRow[];
+}
 
+export async function updateLastNotifiedTimestamp(
+    db: D1Database,
+    user_id: string,
+    hashed_dir: string
+) {
+    const now = Math.floor(Date.now() / 1000);
+    await db
+        .prepare(
+            `UPDATE subscriptions
+             SET last_alert_ts = ?1
+             WHERE user_id = ?2 AND hashed_dir = ?3`
+        )
+        .bind(now, user_id, hashed_dir)
+        .run();
+}

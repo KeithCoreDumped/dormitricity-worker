@@ -7,21 +7,19 @@ import {
     ensureTargetEnabled,
     insertSubscription,
     listSubscriptionsWithLatest,
-    // updateSubscriptionAlert,
     deleteSubscriptionAndMaybeDisableTarget,
     getLatest,
     getSeriesForUser,
     getUserById,
     deleteUser,
-    // setAlertRuleByKey,
-    // disableAlertRuleByKey,
-    // updateNotifyChannel,
     updateSubscriptionNotify,
     verifySubscription,
+    getSubscriptionsForHashedDir,
+    updateLastNotifiedTimestamp,
 } from "./db.js";
 import { dispatchWorkflow } from "./github.js";
-import { sendTestNotification } from "./notify.js";
-import type { Env, NotifyChannel, Target } from "./types.js";
+import { sendTestNotification, sendAlert } from "./notify.js";
+import type { Env, NotifyChannel, SetAlertOptions, Target } from "./types.js";
 import { hashPassword, verifyPassword, signUser, verifyUser } from "./auth.js";
 import { hmacDorm } from "./hmac.js";
 import { ALLOW_ORIGINS, buildCorsHeaders, isPreflight } from "./cors.js";
@@ -52,7 +50,7 @@ async function parseJSON<T = any>(req: Request): Promise<T> {
     }
 }
 
-const scheduled = async (_: ScheduledEvent | undefined, env: Env) => {
+const scheduled = async (_: unknown | undefined, env: Env) => {
     console.log("in scheduled()");
     const targets: Target[] = await fetchEnabledTargets(env.DB);
     if (targets.length === 0) return;
@@ -95,7 +93,6 @@ const route = async (req: Request, env: Env) => {
             return new Response("forbidden", { status: 403 });
         const body = (await req.json()) as { job_id: string };
         const { job_id } = body;
-        // const { job_id } = await req.json();
         if (payload.job_id !== body.job_id)
             return new Response("bad job", { status: 400 });
 
@@ -106,17 +103,6 @@ const route = async (req: Request, env: Env) => {
             ...slice,
             deadline_ts: Math.floor(Date.now() / 1000) + 8 * 60,
         });
-        /*
-            {
-              "job_id": "uuid",
-              "slice_index": 0,
-              "targets": [
-                { "hashed_dir":"hashA...", "canonical_id":"campus:1:2:301" },
-                { "hashed_dir":"hashB...", "canonical_id":"campus:1:2:302" }
-              ],
-              "deadline_ts": 169...
-            }
-            */
     }
 
     if (url.pathname === "/crawler/ingest" && req.method === "POST") {
@@ -128,11 +114,69 @@ const route = async (req: Request, env: Env) => {
         if (!payload.scope?.includes("ingest"))
             return new Response("forbidden", { status: 403 });
 
-        const body = (await req.json()) as { job_id: string };
+        const body = (await req.json()) as {
+            job_id: string;
+            readings: { hashed_dir: string }[];
+        };
         if (payload.job_id !== body.job_id)
             return new Response("bad job", { status: 400 });
 
         await ingestBatch(env.DB, body);
+
+        // --- BEGIN NOTIFICATION LOGIC ---
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            // Get unique hashed_dirs from the ingested batch
+            const hashed_dirs = [...new Set(body.readings.map(r => r.hashed_dir))];
+
+            for (const hashed_dir of hashed_dirs) {
+                const subs = await getSubscriptionsForHashedDir(env.DB, hashed_dir);
+
+                for (const sub of subs) {
+                    // Null safety checks for properties that can be null from the database query
+                    if (sub.last_kwh === null || sub.last_kwh === undefined) {
+                        continue;
+                    }
+                    
+                    // Cooldown check
+                    if (now - sub.last_alert_ts < sub.cooldown_sec) {
+                        continue;
+                    }
+
+                    let alertSent = false;
+
+                    // 1. Low power threshold
+                    if (sub.threshold_kwh > 0 && sub.last_kwh < sub.threshold_kwh) {
+                        console.log(`[ALERT] Low power for ${sub.canonical_id}`);
+                        const res = await sendAlert(sub, "low_power", {});
+                        if (res.ok) {
+                            await updateLastNotifiedTimestamp(env.DB, sub.user_id, sub.hashed_dir);
+                            alertSent = true;
+                        } else {
+                            console.error(`[ALERT_FAIL] Failed to send low_power alert for ${sub.canonical_id}: ${res.error}`);
+                        }
+                    }
+
+                    // 2. Depletion time, only if low power alert was not sent
+                    if (!alertSent && sub.within_hours > 0 && sub.last_kw && sub.last_kw < 0) {
+                        const hours_remaining = sub.last_kwh / -sub.last_kw;
+                        if (hours_remaining < sub.within_hours) {
+                            console.log(`[ALERT] Depletion imminent for ${sub.canonical_id}`);
+                            const res = await sendAlert(sub, "depletion_imminent", { hours_remaining });
+                            if (res.ok) {
+                                await updateLastNotifiedTimestamp(env.DB, sub.user_id, sub.hashed_dir);
+                            } else {
+                                console.error(`[ALERT_FAIL] Failed to send depletion_imminent alert for ${sub.canonical_id}: ${res.error}`);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: any) {
+            console.error("Error during notification dispatch after ingest:", e);
+        }
+        // --- END NOTIFICATION LOGIC ---
+
         return new Response("OK");
     }
 
@@ -230,19 +274,16 @@ const route = async (req: Request, env: Env) => {
             );
         }
         const { threshold_kwh, within_hours, notify_channel, notify_token, cooldown_sec } =
-            await parseJSON<{
-                threshold_kwh?: number;
-                within_hours?: number;
-                notify_channel?: NotifyChannel;
+            await parseJSON<SetAlertOptions & {
+                notify_channel: NotifyChannel;
                 notify_token?: string;
-                cooldown_sec?: number;
             }>(req);
 
-        if (threshold_kwh === undefined || within_hours === undefined || !notify_channel || cooldown_sec === undefined) {
+        if (!notify_channel) {
             return json(
                 {
                     error: "BAD_REQUEST",
-                    detail: "threshold_kwh, within_hours, cooldown_sec and notify_channel are required",
+                    detail: "notify_channel is required",
                 },
                 400
             );
@@ -269,7 +310,6 @@ const route = async (req: Request, env: Env) => {
             );
         }
 
-        // TODO: check token/channel integrity
         try {
             await updateSubscriptionNotify(
                 env.DB,
@@ -304,22 +344,27 @@ const route = async (req: Request, env: Env) => {
         const user = await requireUser(req, env);
         if (!user) return json({ error: "UNAUTHORIZED" }, 401);
 
-        const { notify_channel, notify_token } = await parseJSON<{
+        const { notify_channel, notify_token, canonical_id } = await parseJSON<{
             notify_channel: NotifyChannel;
             notify_token: string;
+            canonical_id: string;
         }>(req);
 
-        if (!notify_channel || !notify_token) {
+        if (!notify_channel || !notify_token || !canonical_id) {
             return json(
                 {
                     error: "BAD_REQUEST",
-                    detail: "notify_channel and notify_token are required",
+                    detail: "notify_channel, notify_token, and canonical_id are required",
                 },
                 400
             );
         }
 
-        const result = await sendTestNotification(notify_channel, notify_token);
+        const result = await sendTestNotification(
+            notify_channel,
+            notify_token,
+            canonical_id
+        );
         return json(result);
     }
 
@@ -359,7 +404,6 @@ const route = async (req: Request, env: Env) => {
         const { email } = await parseJSON<{ email: string }>(req);
         if (!email) return json({ error: "EMAIL_REQUIRED" }, 400);
 
-        // 取数据库中的邮箱并校验（大小写不敏感，去除首尾空格）
         const dbUser = await getUserById(env.DB, user.uid);
         if (!dbUser) return json({ error: "USER_NOT_FOUND" }, 404);
 
@@ -368,12 +412,9 @@ const route = async (req: Request, env: Env) => {
             return json({ error: "EMAIL_MISMATCH" }, 400);
         }
 
-        // 通过校验，执行删除（含级联清理订阅 & 禁用无人订阅宿舍）
         const res = await deleteUser(env.DB, user.uid);
-        return json({ ok: true, ...res }); // { ok:true, deleted:1, disabledTargets:N }
+        return json({ ok: true, ...res });
     }
-
-
 
     return new Response("Not Found", { status: 404 });
 };
@@ -382,7 +423,6 @@ export default {
     scheduled,
 
     async fetch(req: Request, env: Env) {
-        // check preflight/CORS
         const origin = req.headers.get("Origin") || "";
         const okOrigin = ALLOW_ORIGINS.has(origin);
         if (isPreflight(req)) {
@@ -392,10 +432,8 @@ export default {
             });
         }
 
-        // 你原有的路由处理
-        const res = await route(req, env); // 假设你把原逻辑封装成 route()
+        const res = await route(req, env);
 
-        // 给实际响应也加上 CORS 头（仅允许的来源）
         if (okOrigin) {
             const h = new Headers(res.headers);
             const cors = buildCorsHeaders(origin);

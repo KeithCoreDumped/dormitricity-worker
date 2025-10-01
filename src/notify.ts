@@ -1,9 +1,9 @@
-import type { NotifyChannel } from "./types.js";
+import type { NotifyChannel, SubscriptionRow } from "./types.js";
 
 // We don't use the normalizeTokenForChannel from db.ts here,
 // because we want to test the raw token/URL provided by the user.
 function getWebhookUrl(channel: NotifyChannel, token: string): string {
-    if (/^https?:\/\//i.test(token)) {
+    if (/^https?:\]/i.test(token)) {
         return token;
     }
     switch (channel) {
@@ -41,9 +41,11 @@ function getPayload(channel: NotifyChannel, title: string, body: string) {
     }
 }
 
-export async function sendTestNotification(
+async function sendMessage(
     channel: NotifyChannel,
-    token: string
+    token: string,
+    title: string,
+    body: string
 ): Promise<{ ok: boolean; error?: string }> {
     if (channel === "none" || !token) {
         return {
@@ -53,11 +55,7 @@ export async function sendTestNotification(
     }
 
     const url = getWebhookUrl(channel, token);
-    const testTitle = "Dormitricity 通知测试";
-    const testBody =
-        "【宿舍电费】这是一条来自 Dormitricity 的测试消息。如果您收到此消息，说明您的通知设置已生效。";
-
-    const payload = getPayload(channel, testTitle, testBody);
+    const payload = getPayload(channel, title, body);
 
     try {
         const response = await fetch(url, {
@@ -89,17 +87,6 @@ export async function sendTestNotification(
             }
         }
 
-        // if (!response.ok) {
-        //     const errorBody = await response.text();
-        //     console.error(
-        //         `Webhook failed for ${channel} with status ${response.status}: ${errorBody}`
-        //     );
-        //     return {
-        //         ok: false,
-        //         error: `Webhook request failed with status ${response.status}. Response: ${errorBody}`,
-        //     };
-        // }
-
         const result = (await response.json()) as WebhookResult;
         const normalized = normalizeResult(channel, result);
 
@@ -111,32 +98,46 @@ export async function sendTestNotification(
             };
         }
 
-        // // Some webhooks might return a success status but have an error code in the body.
-        // const result = (await response.json()) as {
-        //     msg?: string;
-        //     errmsg?: string;
-        //     message?: string;
-        //     errcode?: number;
-        //     code?: number;
-        // };
-        // // Feishu: { code: 0, msg: "success" }
-        // // WxWork: { errcode: 0, errmsg: "ok" }
-        // // ServerChan: { code: 0, message: "" }
-        // if (
-        //     (channel === "feishu" && result.code !== 0) ||
-        //     (channel === "wxwork" && result.errcode !== 0) ||
-        //     (channel === "serverchan" && result.code !== 0)
-        // ) {
-        //     console.error(`Webhook for ${channel} reported an error:`, result);
-        //     return {
-        //         ok: false,
-        //         error: `Webhook reported an error: ${JSON.stringify(result)}`,
-        //     };
-        // }
-
         return { ok: true };
     } catch (e: any) {
-        console.error(`Error sending test notification for ${channel}:`, e);
+        console.error(`Error sending message for ${channel}:`, e);
         return { ok: false, error: e.message || "An unknown error occurred." };
     }
+}
+
+export async function sendTestNotification(
+    channel: NotifyChannel,
+    token: string,
+    canonical_id: string
+): Promise<{ ok: boolean; error?: string }> {
+    const testTitle = "Dormitricity 通知测试";
+    const testBody =
+        `正在为宿舍 ${canonical_id} 配置提醒。这是一条测试消息，用于验证您的通知配置是否正常工作。`;
+    
+    return await sendMessage(channel, token, testTitle, testBody);
+}
+
+export async function sendAlert(
+    sub: SubscriptionRow,
+    reason: "low_power" | "depletion_imminent",
+    details: { hours_remaining?: number }
+): Promise<{ ok: boolean; error?: string }> {
+    let title = "";
+    let body = "";
+
+    if (reason === "low_power") {
+        title = "Dormitricity: 低电量提醒";
+        body = `宿舍 ${sub.canonical_id} 当前剩余电量 ${sub.last_kwh!.toFixed(2)} kWh，已低于您设置的 ${sub.threshold_kwh} kWh 阈值。`;
+    } else if (reason === "depletion_imminent") {
+        title = "Dormitricity: 即将耗尽提醒";
+        body = `宿舍 ${sub.canonical_id} 当前剩余电量 ${sub.last_kwh!.toFixed(2)} kWh，预计将在 ${details.hours_remaining!.toFixed(1)} 小时内用尽，已低于 ${sub.within_hours} 小时阈值。`;
+    } else {
+        return { ok: false, error: "Unknown alert reason" };
+    }
+
+    if (!sub.notify_token) {
+        return { ok: false, error: "Notification token is not configured." };
+    }
+
+    return await sendMessage(sub.notify_channel, sub.notify_token, title, body);
 }

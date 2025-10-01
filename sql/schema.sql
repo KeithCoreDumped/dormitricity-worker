@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS dorm_latest (
   hashed_dir TEXT PRIMARY KEY,
   last_ts INTEGER NOT NULL,
   last_kwh REAL NOT NULL,
+  last_kw REAL,
   FOREIGN KEY (hashed_dir) REFERENCES crawl_targets(hashed_dir) ON DELETE CASCADE
 );
 
