@@ -79,6 +79,12 @@ const route = async (req: Request, env: Env) => {
     }
 
     if (url.pathname === "/trigger") {
+        const { token } = await parseJSON<{
+            token: string;
+        }>(req);
+        if (token !== env.TRIGGER_SECRET) {
+            return new Response("Unauthorized", { status: 401 });
+        }
         await scheduled(undefined, env);
         return new Response("scheduled() triggered manually");
     }
@@ -127,17 +133,22 @@ const route = async (req: Request, env: Env) => {
         try {
             const now = Math.floor(Date.now() / 1000);
             // Get unique hashed_dirs from the ingested batch
-            const hashed_dirs = [...new Set(body.readings.map(r => r.hashed_dir))];
+            const hashed_dirs = [
+                ...new Set(body.readings.map((r) => r.hashed_dir)),
+            ];
 
             for (const hashed_dir of hashed_dirs) {
-                const subs = await getSubscriptionsForHashedDir(env.DB, hashed_dir);
+                const subs = await getSubscriptionsForHashedDir(
+                    env.DB,
+                    hashed_dir
+                );
 
                 for (const sub of subs) {
                     // Null safety checks for properties that can be null from the database query
                     if (sub.last_kwh === null || sub.last_kwh === undefined) {
                         continue;
                     }
-                    
+
                     // Cooldown check
                     if (now - sub.last_alert_ts < sub.cooldown_sec) {
                         continue;
@@ -146,34 +157,65 @@ const route = async (req: Request, env: Env) => {
                     let alertSent = false;
 
                     // 1. Low power threshold
-                    if (sub.threshold_kwh > 0 && sub.last_kwh < sub.threshold_kwh) {
-                        console.log(`[ALERT] Low power for ${sub.canonical_id}`);
+                    if (
+                        sub.threshold_kwh > 0 &&
+                        sub.last_kwh < sub.threshold_kwh
+                    ) {
+                        console.log(
+                            `[ALERT] Low power for ${sub.canonical_id}`
+                        );
                         const res = await sendAlert(sub, "low_power", {});
                         if (res.ok) {
-                            await updateLastNotifiedTimestamp(env.DB, sub.user_id, sub.hashed_dir);
+                            await updateLastNotifiedTimestamp(
+                                env.DB,
+                                sub.user_id,
+                                sub.hashed_dir
+                            );
                             alertSent = true;
                         } else {
-                            console.error(`[ALERT_FAIL] Failed to send low_power alert for ${sub.canonical_id}: ${res.error}`);
+                            console.error(
+                                `[ALERT_FAIL] Failed to send low_power alert for ${sub.canonical_id}: ${res.error}`
+                            );
                         }
                     }
 
                     // 2. Depletion time, only if low power alert was not sent
-                    if (!alertSent && sub.within_hours > 0 && sub.last_kw && sub.last_kw < 0) {
+                    if (
+                        !alertSent &&
+                        sub.within_hours > 0 &&
+                        sub.last_kw &&
+                        sub.last_kw < 0
+                    ) {
                         const hours_remaining = sub.last_kwh / -sub.last_kw;
                         if (hours_remaining < sub.within_hours) {
-                            console.log(`[ALERT] Depletion imminent for ${sub.canonical_id}`);
-                            const res = await sendAlert(sub, "depletion_imminent", { hours_remaining });
+                            console.log(
+                                `[ALERT] Depletion imminent for ${sub.canonical_id}`
+                            );
+                            const res = await sendAlert(
+                                sub,
+                                "depletion_imminent",
+                                { hours_remaining }
+                            );
                             if (res.ok) {
-                                await updateLastNotifiedTimestamp(env.DB, sub.user_id, sub.hashed_dir);
+                                await updateLastNotifiedTimestamp(
+                                    env.DB,
+                                    sub.user_id,
+                                    sub.hashed_dir
+                                );
                             } else {
-                                console.error(`[ALERT_FAIL] Failed to send depletion_imminent alert for ${sub.canonical_id}: ${res.error}`);
+                                console.error(
+                                    `[ALERT_FAIL] Failed to send depletion_imminent alert for ${sub.canonical_id}: ${res.error}`
+                                );
                             }
                         }
                     }
                 }
             }
         } catch (e: any) {
-            console.error("Error during notification dispatch after ingest:", e);
+            console.error(
+                "Error during notification dispatch after ingest:",
+                e
+            );
         }
         // --- END NOTIFICATION LOGIC ---
 
@@ -273,11 +315,18 @@ const route = async (req: Request, env: Env) => {
                 400
             );
         }
-        const { threshold_kwh, within_hours, notify_channel, notify_token, cooldown_sec } =
-            await parseJSON<SetAlertOptions & {
+        const {
+            threshold_kwh,
+            within_hours,
+            notify_channel,
+            notify_token,
+            cooldown_sec,
+        } = await parseJSON<
+            SetAlertOptions & {
                 notify_channel: NotifyChannel;
                 notify_token?: string;
-            }>(req);
+            }
+        >(req);
 
         if (!notify_channel) {
             return json(

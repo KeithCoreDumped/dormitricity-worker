@@ -11,6 +11,7 @@ export interface Env {
     GH_REF?: string; // default "main"
     USER_JWT_SECRET: string;
     DORM_HASH_KEY: string;
+    TRIGGER_SECRET: string;
 }
 
 export interface Target {
